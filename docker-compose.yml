@@ -1,0 +1,353 @@
+# =============================================================================
+# Docker Compose — Pipeline de Indicadores Econômicos
+# Ambiente de desenvolvimento local
+#
+# EXECUTOR ESCOLHIDO: LocalExecutor
+#
+# O Airflow suporta diferentes executores que determinam COMO as tasks são
+# executadas. Os principais são:
+#
+#   SequentialExecutor  → executa 1 task por vez (padrão, usa SQLite)
+#   LocalExecutor       → executa tasks em paralelo no mesmo processo do scheduler
+#   CeleryExecutor      → distribui tasks para workers via fila Redis/RabbitMQ
+#   KubernetesExecutor  → cada task vira um Pod no Kubernetes
+#
+# Para desenvolvimento local escolhemos LocalExecutor porque:
+#   - Sem Redis, sem Celery workers → muito mais simples de configurar
+#   - Suporta paralelismo (diferente do SequentialExecutor)
+#   - Usa PostgreSQL (necessário para paralelismo; SequentialExecutor usa SQLite)
+#   - O scheduler executa as tasks diretamente como subprocessos no mesmo container
+#
+# SERVIÇOS E ORDEM DE INICIALIZAÇÃO:
+#
+#   postgres           (sobe primeiro, aguarda healthcheck pg_isready)
+#       ↓ service_healthy
+#   airflow-init       (inicializa banco + cria usuário admin, roda uma vez)
+#       ↓ service_completed_successfully
+#   airflow-webserver  (UI em http://localhost:8080)
+#   airflow-scheduler  (monitora DAGs e executa tasks via LocalExecutor)
+# =============================================================================
+
+# =============================================================================
+# YAML ANCHOR: x-airflow-common
+#
+# YAML anchors (&nome) definem um bloco reutilizável. Em outro lugar,
+# "<<: *nome" faz um "merge" desse bloco, como se você tivesse copiado
+# e colado o conteúdo ali.
+#
+# Por que o prefixo "x-"?
+#   Docker Compose interpreta chaves no nível raiz como serviços, volumes, etc.
+#   O prefixo "x-" indica que é um "extension field" — o Compose ignora como
+#   definição de serviço mas mantém disponível para anchors YAML.
+#
+# Benefício: evita repetir a mesma configuração (build, volumes, networks,
+# env_file) três vezes nos serviços airflow-init, airflow-webserver e
+# airflow-scheduler. Uma mudança aqui afeta os três automaticamente.
+# =============================================================================
+x-airflow-common: &airflow-common
+  # Constrói a imagem a partir do nosso Dockerfile customizado.
+  # O "context" define o diretório de build — o Dockerfile acessa apenas
+  # arquivos dentro dele (por isso o requirements.txt está em docker/airflow/).
+  build:
+    context: ./docker/airflow
+    dockerfile: Dockerfile
+
+  # Carrega variáveis de ambiente do arquivo dev.env.
+  # Estas variáveis configuram o Airflow, AWS e dbt.
+  env_file:
+    - ./config/dev.env
+
+  environment:
+    # Sobrescreve configurações do Airflow via variáveis de ambiente.
+    # O Airflow lê variáveis no formato AIRFLOW__{SECAO}__{CHAVE} e as
+    # aplica sobre o airflow.cfg — mais flexível que editar o arquivo diretamente.
+
+    # String de conexão com o PostgreSQL de metadados do Airflow.
+    # "postgres" é o hostname do serviço PostgreSQL neste compose.
+    # O Docker resolve automaticamente "postgres" para o IP do container
+    # porque ambos estão na mesma rede (airflow-network).
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Desabilita os DAGs de exemplo que vêm instalados por padrão no Airflow.
+    # Esses exemplos poluem a UI e podem executar tarefas indesejadas.
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # DAGs novos ficam PAUSADOS até ativação manual.
+    # Boa prática: evita que um DAG recém-criado execute imediatamente em prod.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+
+  # BIND MOUNTS: mapeia diretórios do host para dentro dos containers.
+  #
+  # Diferença entre bind mount e named volume:
+  #   Bind mount (./dags:/opt/airflow/dags):
+  #     - Aponta para um diretório REAL no seu computador
+  #     - Mudanças no host são refletidas imediatamente no container
+  #     - Essencial para desenvolvimento: edite um DAG e o Airflow atualiza
+  #       automaticamente sem rebuild da imagem
+  #
+  #   Named volume (postgres-data, declarado em "volumes:"):
+  #     - Gerenciado pelo Docker em sua própria área de armazenamento
+  #     - Persiste entre "docker compose down" e "docker compose up"
+  #     - Só é removido com "docker compose down -v"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - ./dbt_project:/opt/airflow/dbt_project
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+
+  networks:
+    - airflow-network
+
+  # depends_on com condition: garante a ordem de inicialização correta.
+  # "service_healthy" aguarda o healthcheck do postgres passar antes de iniciar.
+  # Sem isso, o Airflow tentaria conectar ao banco antes dele estar pronto.
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+# =============================================================================
+# SERVIÇOS
+# =============================================================================
+services:
+
+  # ===========================================================================
+  # PostgreSQL 16 — banco de dados central do projeto
+  #
+  # Serve dois bancos distintos dentro do mesmo container:
+  #
+  #   banco "airflow"      → metadados internos do Airflow
+  #                          (dag_runs, task_instances, connections, xcom, etc.)
+  #                          Criado automaticamente pela variável POSTGRES_DB.
+  #
+  #   banco "indicadores"  → dados processados pelo dbt (gold layer)
+  #                          Consumido pelo Streamlit para os dashboards.
+  #                          Criado pelo script init-multiple-dbs.sh.
+  #
+  # Em produção: dois bancos RDS separados, com usuários e permissões distintas.
+  # Em dev: um container só para simplificar o setup e economizar recursos.
+  # ===========================================================================
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      # O banco "airflow" é criado automaticamente pela imagem oficial
+      # quando POSTGRES_DB é definido.
+      POSTGRES_DB: airflow
+    volumes:
+      # Named volume: os dados do PostgreSQL persistem entre reinicializações.
+      # Sem este volume, TODOS os dados (metadados do Airflow + dados do dbt)
+      # seriam perdidos cada vez que o container fosse recriado.
+      - postgres-data:/var/lib/postgresql/data
+
+      # Script de inicialização: cria o banco "indicadores" no primeiro start.
+      # A imagem oficial do PostgreSQL executa automaticamente todos os arquivos
+      # .sh e .sql presentes em /docker-entrypoint-initdb.d/ na primeira vez.
+      - ./docker/postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
+    ports:
+      # Expõe o PostgreSQL para ferramentas externas no seu computador.
+      # Permite conectar com DBeaver, psql local, TablePlus, etc.
+      # Formato: "porta_no_host:porta_no_container"
+      - "5432:5432"
+    networks:
+      - airflow-network
+    healthcheck:
+      # pg_isready: ferramenta oficial do PostgreSQL para verificar se o servidor
+      # está aceitando conexões. Retorna 0 (sucesso) quando o banco está pronto.
+      # O Docker usa esse retorno para decidir se o serviço está "healthy".
+      test: ["CMD", "pg_isready", "-U", "airflow", "-d", "airflow"]
+      interval: 10s      # verifica a cada 10 segundos
+      timeout: 5s        # considera falha se não responder em 5s
+      retries: 5         # após 5 falhas consecutivas, marca como unhealthy
+      start_period: 10s  # aguarda 10s antes de começar a contar falhas
+                         # (dá tempo para o PostgreSQL inicializar pela 1ª vez)
+
+  # ===========================================================================
+  # Airflow Init — inicialização do banco de metadados (roda uma vez)
+  #
+  # Este serviço executa dois comandos e depois TERMINA (exit 0):
+  #   1. "airflow db migrate": cria/atualiza todas as tabelas internas do Airflow
+  #      no banco PostgreSQL. Equivalente a rodar migrations de um ORM.
+  #   2. "airflow users create": cria o usuário admin para acessar a UI.
+  #
+  # Por que um serviço separado?
+  #   Porque "db migrate" precisa rodar ANTES do webserver e do scheduler,
+  #   mas só precisa rodar UMA vez por setup. Separar em serviço próprio com
+  #   restart: "no" garante que não fique rodando em loop como os outros.
+  #
+  # "service_completed_successfully": o webserver e o scheduler só sobem
+  #   quando este serviço terminar com exit code 0 (sucesso).
+  # ===========================================================================
+  airflow-init:
+    <<: *airflow-common
+    # Inicialização do banco de metadados do Airflow.
+    #
+    # NOTA SOBRE USUÁRIOS NO AIRFLOW 3.x:
+    #   No Airflow 2.x usávamos "airflow users create" aqui, mas o auth
+    #   manager padrão do Airflow 3.x (SimpleAuthManager) NÃO usa esse
+    #   comando — o gerenciamento de usuários funciona por configuração,
+    #   não por banco de dados.
+    #
+    #   Em dev, configuramos AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=true
+    #   no dev.env, que faz qualquer login virar Admin (use admin/admin ou
+    #   o que preferir). Por isso este init só precisa rodar o "db migrate".
+    command: airflow db migrate
+    # restart: "no" garante que o Docker não tente reiniciar este container
+    # após ele terminar. Ele deve rodar uma vez e ficar como "exited (0)".
+    restart: "no"
+
+  # ===========================================================================
+  # Airflow API Server — interface web e API do Airflow
+  #
+  # MUDANÇA IMPORTANTE NO AIRFLOW 3.x:
+  #   O comando "airflow webserver" foi REMOVIDO no Airflow 3.0.
+  #   Agora se chama "airflow api-server" porque o Airflow 3.x reescreveu
+  #   a UI como um app React que consome a API REST diretamente — não há
+  #   mais servidor Flask renderizando HTML server-side.
+  #
+  # Responsável por:
+  #   - Servir a UI em http://localhost:8080 (React app)
+  #   - Expor a API REST do Airflow (/api/v2/...)
+  #   - Permitir trigger manual de DAGs, gerenciar conexões e variáveis
+  #
+  # O api-server NÃO executa tasks nem parseia DAGs — é puramente interface
+  # e API. Execução fica com o scheduler, parsing fica com o dag-processor.
+  # ===========================================================================
+  airflow-api-server:
+    <<: *airflow-common
+    command: airflow api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # No Airflow 3.x o endpoint de health do api-server fica em
+      # /api/v2/monitor/health (mudou de lugar em relação ao Airflow 2.x).
+      # --fail: o curl retorna exit code não-zero em erros HTTP (4xx, 5xx),
+      # que o Docker interpreta como "unhealthy".
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # start_period generoso: o Airflow demora para iniciar (carrega config,
+      # conecta ao banco, inicia servidor). Falhas durante este período
+      # não contam para o limite de retries.
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # Airflow Scheduler — motor de agendamento e execução de tasks
+  #
+  # Responsável por:
+  #   - Criar DagRuns conforme o schedule definido em cada DAG
+  #   - Com LocalExecutor: executar as tasks como subprocessos Python
+  #     diretamente no mesmo container (sem workers separados)
+  #
+  # MUDANÇA NO AIRFLOW 3.x:
+  #   No Airflow 2.x, o scheduler também era responsável por parsear os
+  #   arquivos de DAGs (descobrir novos DAGs, detectar mudanças no código).
+  #   No Airflow 3.x, isso foi separado em um processo independente
+  #   chamado "dag-processor" (serviço abaixo). O scheduler agora SÓ
+  #   agenda — não toca nos arquivos de DAG diretamente.
+  #
+  # Com CeleryExecutor, o scheduler apenas enfileira tasks no Redis.
+  # Com LocalExecutor, o scheduler TAMBÉM executa as tasks — é por isso
+  # que não precisamos de um serviço "airflow-worker" neste compose.
+  #
+  # NOTA SOBRE O HEALTHCHECK:
+  #   O comando "airflow jobs check" consulta o banco de metadados do Airflow
+  #   para verificar se o scheduler está registrando heartbeats regularmente.
+  #   O scheduler grava um heartbeat no banco a cada ~5 segundos — se parar
+  #   de gravar, algo está errado e o healthcheck falha.
+  #
+  #   $${HOSTNAME}: o $$ é um escape do Docker Compose para produzir um $
+  #   literal no shell. Sem o escape, o Compose tentaria substituir ${HOSTNAME}
+  #   como variável do Compose (e falharia porque não existe).
+  # ===========================================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    command: airflow scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # Airflow DAG Processor — parsing dos arquivos de DAG (NOVO no Airflow 3.x)
+  #
+  # POR QUE EXISTE COMO SERVIÇO SEPARADO:
+  #   No Airflow 2.x, o scheduler fazia DUAS coisas:
+  #     1. Parsear os arquivos Python em /opt/airflow/dags/
+  #     2. Agendar e despachar as tasks dos DAGs
+  #
+  #   Esse acoplamento causava problemas: um DAG mal escrito (loop infinito,
+  #   import lento) podia travar o scheduler inteiro e parar o agendamento
+  #   de TODOS os outros DAGs.
+  #
+  #   No Airflow 3.x, esse parsing foi extraído para um processo separado:
+  #   o dag-processor. Ele lê os arquivos, serializa os DAGs no banco de
+  #   metadados, e o scheduler lê apenas a versão serializada do banco.
+  #   Resultado: scheduler nunca trava por causa de um DAG ruim.
+  #
+  # IMPORTANTE: Sem este serviço rodando, o Airflow 3.x simplesmente
+  # NÃO ENXERGA seus DAGs — o scheduler não vai disparar nada porque
+  # ninguém está populando a tabela de DAGs serializados.
+  # ===========================================================================
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: airflow dag-processor
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "DagProcessorJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+# =============================================================================
+# VOLUMES NOMEADOS
+#
+# Volumes nomeados são gerenciados pelo Docker em sua própria área de
+# armazenamento (geralmente /var/lib/docker/volumes/ no Linux).
+#
+# Vantagens sobre bind mounts para dados de banco:
+#   - Persistem entre "docker compose down" e "docker compose up"
+#   - Não poluem o diretório do projeto com arquivos binários do PostgreSQL
+#   - Não são afetados acidentalmente por "git clean" ou "rm -rf"
+#   - Melhor performance de I/O no Docker Desktop (Mac/Windows)
+#
+# Para remover TODOS os dados e começar do zero:
+#   docker compose down -v   (o -v remove os named volumes também)
+# =============================================================================
+volumes:
+  postgres-data:
+
+# =============================================================================
+# REDES
+#
+# Uma rede bridge isolada para todos os serviços deste compose.
+# Dentro desta rede, cada serviço é acessível pelo seu NOME como hostname:
+#   - "postgres" → container do PostgreSQL
+#   - "airflow-webserver" → container do webserver
+#   - etc.
+#
+# O Docker tem um DNS interno que resolve esses nomes automaticamente.
+# É por isso que a string de conexão usa "@postgres:5432" e não um IP.
+#
+# Isolar em uma rede própria (em vez de usar a rede padrão do Docker)
+# é uma boa prática: garante que esses serviços não interferem com outros
+# containers que você possa ter rodando no seu Docker.
+# =============================================================================
+networks:
+  airflow-network:
+    driver: bridge
